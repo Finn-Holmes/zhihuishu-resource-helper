@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         智慧树新形态课程 · 学习资源逐个打开
 // @namespace    local.zhihuishu.resource-opener
-// @version      1.2.4
+// @version      1.2.6
 // @description  逐个打开学习资源并正常播放视频，支持刷新接续、暂停、完成状态检查和日志导出。
 // @match        https://ai-smart-course-student-pro.zhihuishu.com/*
 // @run-at       document-idle
-// @grant        none
+// @grant        GM_openInTab
+// @grant        unsafeWindow
 // @noframes
 // ==/UserScript==
 
@@ -42,43 +43,63 @@
   let activeVideo = null;
   let activeExternal = null;
 
-  function externalURL(value) {
+  function externalURL(value, allowEmpty = false) {
     try {
+      if (allowEmpty && (value == null || String(value).trim() === '')) return new URL('about:blank');
       const url = new URL(value, location.href);
-      return /^https?:$/.test(url.protocol) && url.host !== location.host ? url : null;
+      return (url.protocol === 'about:' && url.pathname === 'blank') ||
+        (/^https?:$/.test(url.protocol) && url.host !== location.host) ? url : null;
     } catch { return null; }
   }
 
   function watchExternal(resource, key) {
-    const originalOpen = window.open;
+    const pageWindow = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+    const originalOpen = pageWindow.open;
     const started = Date.now();
     const watch = { opened: false, error: null, child: null, stopped: false };
     const stopCapture = () => {
       watch.stopped = true;
-      if (window.open === wrappedOpen) window.open = originalOpen;
+      if (pageWindow.open === wrappedOpen) pageWindow.open = originalOpen;
       document.removeEventListener('click', onLink);
       document.removeEventListener('pointerdown', onUserInput, true);
       document.removeEventListener('keydown', onUserInput, true);
     };
     const onUserInput = event => { if (event.isTrusted) stopCapture(); };
     function wrappedOpen(url, target, features) {
-      const external = externalURL(url);
+      const external = externalURL(url, true);
       if (watch.stopped || !external || Date.now() - started > 10000 ||
           runState?.pending?.key !== key || controller?.signal.aborted ||
           location.pathname !== expectedPath || !resource.node.isConnected) {
-        return originalOpen.call(window, url, target, features);
+        return originalOpen.call(pageWindow, url, target, features);
       }
-      // 使用新窗口，避免复用并关闭用户原有的具名标签页。保留网站提供的窗口特性。
-      const child = originalOpen.call(window, url, '_blank', features);
+      // 扩展创建独立后台标签页，不依赖跨域 WindowProxy 或给外站提供 opener。
+      // 不再调用原生 open，避免 noopener 返回 null 后再次打开造成重复标签页。
+      let child;
+      try {
+        if (typeof GM_openInTab !== 'function') throw new Error('缺少 GM_openInTab 权限，请完整替换脚本（含开头权限声明）并保存、刷新。');
+        child = GM_openInTab(external.href, { active: false, insert: true, setParent: true });
+        if (!child || typeof child.close !== 'function') throw new Error('篡改猴未返回可关闭的外部资源标签页，请检查扩展运行权限。');
+      } catch (error) {
+        watch.error = error;
+        stopCapture();
+        return null;
+      }
       watch.opened = true;
       watch.child = child;
-      runState.pending.external = { opened: true, closed: false, host: external.host };
+      const destination = external.host || 'about:blank';
+      runState.pending.external = { opened: true, closed: false, managed: true, host: destination };
+      child.onclose = () => {
+        watch.closed = true;
+        if (runState?.pending?.key === key && runState.pending.external?.managed) {
+          runState.pending.external.closed = true;
+          saveRun();
+        }
+      };
       saveRun();
       stopCapture();
-      if (!child) {
-        watch.error = new Error('未取得外部资源标签页的控制权，可能被浏览器拦截或链接使用了 noopener。请检查新页并手动关闭后重试。');
-      } else log(`已打开外部资源：${resource.title}（${external.host}）`);
-      return child;
+      log(`已通过篡改猴打开外部资源：${resource.title}（${destination}）`);
+      // 与 noopener 的返回行为一致，不把扩展内部标签页句柄交给网站。
+      return null;
     }
     function onLink(event) {
       if (event.isTrusted || event.defaultPrevented || watch.stopped) return;
@@ -91,19 +112,19 @@
       stopCapture();
       if (watch.child) {
         try {
-          if (!watch.child.closed && !watch.closeRequested) {
+          if (!watch.closed && !watch.child.closed && !watch.closeRequested) {
             watch.child.close();
             watch.closeRequested = true;
           }
-          if (watch.child.closed && runState?.pending?.key === key && runState.pending.external) {
+          if ((watch.closed || watch.child.closed) && runState?.pending?.key === key && runState.pending.external) {
             runState.pending.external.closed = true;
             saveRun();
           }
-          if (watch.child.closed) watch.child = null;
+          if (watch.closed || watch.child.closed) watch.child = null;
         } catch (error) { watch.error = error; }
       }
     };
-    window.open = wrappedOpen;
+    pageWindow.open = wrappedOpen;
     document.addEventListener('click', onLink);
     document.addEventListener('pointerdown', onUserInput, true);
     document.addEventListener('keydown', onUserInput, true);
@@ -550,6 +571,16 @@
         const key = JSON.stringify([pointId, resource.key]);
         // 本轮游标独立于历史记录，即使取消“跳过已访问”，刷新也不会重放已处理的资源。
         if (runState.doneResources.includes(key)) continue;
+        // 旧版未捕获空白页而报错时，升级接续只核对已完成卡片，不再重复打开。
+        if (!resource.media && resource.finished && runState.pending?.key === key && !runState.pending.external?.opened) {
+          records[key] = { point: point.name, title: resource.title, group: resource.group,
+            status: 'visited', siteFinished: true, completion: 'site-confirmed-on-resume',
+            dwellSeconds: runState.pending.dwellSeconds, time: new Date().toISOString() };
+          runState.doneResources.push(key); runState.pending = null;
+          saveRecords(); saveRun(); summary();
+          log(`接续时网站已确认资源完成，继续下一项：${resource.title}`);
+          continue;
+        }
         if (resource.audio || (resource.video && !settings.videos)) {
           records[key] = { point: point.name, title: resource.title, group: resource.group,
             status: 'skipped-media', time: new Date().toISOString() };
@@ -708,6 +739,11 @@
     const sameSettings = saved?.settings && Object.keys(settings).every(k => settings[k] === saved.settings[k]);
     const samePoint = points().find(p => p.node.classList.contains('active'))?.key === saved?.queue?.[saved.index]?.key;
     if (saved?.version === 1 && ['paused', 'error'].includes(saved.status) && sameSettings && samePoint) {
+      if (saved.pending?.external?.opened && !saved.pending.external.closed && !saved.pending.external.managed) {
+        delete saved.pending.external;
+        saved.pending.attempts = 0;
+        log('改用篡改猴重新打开该外部资源；旧版遗留的文章标签页请手动关闭，已完成的其他资源记录保留。');
+      }
       saved.status = 'running';
       start(saved);
     } else start();
@@ -715,7 +751,7 @@
 
   function exportRecords() {
     loadRecords();
-    const blob = new Blob([JSON.stringify({ version: '1.2.4', course: route().course,
+    const blob = new Blob([JSON.stringify({ version: '1.2.6', course: route().course,
       exportedAt: new Date().toISOString(), resources: Object.values(records), logs: messages,
       run: JSON.parse(sessionStorage.getItem(`${recordKey}:run`) || 'null') }, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -739,7 +775,7 @@
       #start{background:#2166ce;color:#fff;border-color:#2166ce} .buttons{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
       #status{overflow-wrap:anywhere;margin:10px 0;font-weight:600} #stats,.hint{font-size:12px;color:#53657b} pre{white-space:pre-wrap;overflow-wrap:anywhere;font-family:inherit;font-size:12px;line-height:1.5;min-height:64px;max-height:140px;overflow:auto;background:#f4f7fb;padding:8px;border-radius:6px}
     </style>
-    <details open><summary>学习资源逐个打开 · v1.2.4</summary><div class="body">
+    <details open><summary>学习资源逐个打开 · v1.2.6</summary><div class="body">
       <div class="hint">逐个打开资源；视频按原速播放并检查完成标记。</div>
       <label>范围 <select id="scope"><option value="all">全部知识点</option><option value="current">仅当前知识点（试跑）</option></select></label>
       <label><input id="randomDwell" type="checkbox" checked> 图文每次随机停留 1～5 秒</label>
