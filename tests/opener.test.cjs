@@ -10,6 +10,82 @@ const ids = ['9000000000000000002', '9000000000000000003'];
 const url = id => `https://ai-smart-course-student-pro.zhihuishu.com/learnPage/${course}/${id}/256522`;
 const key = `zhs-resource-opener:v1:${course}:256522`;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+for (const externalMode of ['normal', 'delayed', 'anchor']) {
+  test(`外部文章页打开后关闭并核对完成，不等待内嵌预览：${externalMode}`, async () => {
+    const f = fixture({ externalResource: true, externalMode });
+    try {
+      const manualTab = f.w.open('https://example.org/manual', 'user-window');
+      f.ui('scope').value = 'current'; f.ui('start').click(); await until(f.done);
+      assert.match(f.ui('status').textContent, /本轮非视频资源访问结束/);
+      const article = Object.values(f.records()).find(r => r.title === '外部文章');
+      assert.equal(article.siteFinished, true);
+      assert.equal(article.completion, 'external-and-site-confirmed');
+      assert.equal(f.externalTabs.length, 2);
+      assert.equal(manualTab.closed, false);
+      assert.equal(f.externalTabs[1].closed, true);
+      assert.equal(f.externalTabs[1].target, '_blank');
+      assert.equal(f.w.open, f.originalOpen);
+      assert.ok(f.mediaEvents.indexOf('external-closed') < f.mediaEvents.indexOf('click:共享课件.ppt'));
+    } finally { f.close(); }
+  });
+}
+
+for (const externalMode of ['blocked', 'close-denied']) {
+  test(`外部页面无法打开或关闭时停止，不误记完成：${externalMode}`, async () => {
+    const f = fixture({ externalResource: true, externalMode });
+    try {
+      f.ui('scope').value = 'current'; f.ui('start').click(); await until(f.done);
+      assert.match(f.ui('status').textContent, /外部资源标签页/);
+      assert.equal(Object.keys(f.records()).length, 0);
+      assert.equal(f.calls.includes('0:共享课件.ppt'), false);
+      assert.equal(f.w.open, f.originalOpen);
+    } finally { f.close(); }
+  });
+}
+
+test('外部资源未更新时刷新核对，恢复后不重复打开新标签页', async () => {
+  let f = fixture({ externalResource: true, externalMode: 'unconfirmed', captureReload: true });
+  try {
+    f.ui('scope').value = 'current'; f.ui('start').click(); await until(() => f.navigation);
+    const storage = f.navigation.storage;
+    assert.equal(f.externalTabs[0].closed, true);
+    assert.equal(JSON.parse(storage[`${key}:run`]).pending.external.completionRefresh, true);
+    f.close(); f = fixture({ storage, externalResource: true, externalFinished: true });
+    await until(f.done);
+    assert.match(f.ui('status').textContent, /本轮非视频资源访问结束/);
+    assert.equal(f.externalTabs.length, 0);
+    assert.equal(f.calls.includes('0:外部文章'), false);
+    assert.equal(Object.values(f.records()).find(r => r.title === '外部文章').siteFinished, true);
+  } finally { f.close(); }
+});
+
+test('外部资源刷新后仍未完成则停止，不重复打开或刷新', async () => {
+  let f = fixture({ externalResource: true, externalMode: 'unconfirmed', captureReload: true });
+  try {
+    f.ui('scope').value = 'current'; f.ui('start').click(); await until(() => f.navigation);
+    const storage = f.navigation.storage;
+    f.close(); f = fixture({ storage, externalResource: true, captureReload: true });
+    await until(f.done);
+    assert.match(f.ui('status').textContent, /刷新后网站仍未显示完成/);
+    assert.equal(f.externalTabs.length, 0);
+    assert.equal(f.navigation, null);
+    assert.equal(Object.keys(f.records()).length, 0);
+  } finally { f.close(); }
+});
+
+test('外部页打开期间暂停会关闭该页，继续后仅核对完成', async () => {
+  const f = fixture({ externalResource: true });
+  try {
+    f.ui('scope').value = 'current'; f.ui('seconds').value = '60'; f.ui('start').click();
+    await until(() => f.externalTabs.length > 0);
+    f.ui('pause').click(); await until(f.done);
+    assert.equal(f.externalTabs[0].closed, true);
+    assert.equal(f.w.open, f.originalOpen);
+    f.ui('start').click(); await until(f.done);
+    assert.match(f.ui('status').textContent, /本轮非视频资源访问结束/);
+    assert.equal(f.externalTabs.length, 1);
+  } finally { f.close(); }
+});
 async function until(fn, timeout = 3500) {
   const end = Date.now() + timeout;
   while (Date.now() < end) { if (fn()) return; await sleep(5); }
@@ -37,6 +113,18 @@ function fixture(options = {}) {
   const d = w.document;
   const calls = [];
   const mediaEvents = [];
+  const externalTabs = [];
+  const originalOpen = (url, target, features) => {
+    if (options.externalMode === 'blocked') return null;
+    const child = { url, target, features, closed: false, close() {
+      if (options.externalMode === 'close-denied') return;
+      this.closed = true;
+      mediaEvents.push('external-closed');
+    } };
+    externalTabs.push(child);
+    return child;
+  };
+  w.open = originalOpen;
   let latestVideo = null;
   const realTimeout = w.setTimeout.bind(w);
   w.setTimeout = (fn, ms, ...args) => realTimeout(fn, Math.max(1, ms / 100), ...args);
@@ -69,6 +157,7 @@ function fixture(options = {}) {
     [{ title: '教材片段', type: 'book', finished: false }, { title: '共享课件.ppt', type: 'other', finished: true }, { title: '选学视频', type: 'video', optional: true }],
     [{ title: '共享课件.ppt', type: 'other', finished: true }, { title: '选学图文', type: 'other', optional: true, finished: true }],
   ];
+  if (options.externalResource) data[0][0] = { title: '外部文章', type: 'other', external: true };
   if (options.afterVideoDoc) data[0].push({ title: '视频后图文', type: 'other', optional: true, finished: true });
   function mountVideo(card) {
     d.querySelector('.preview-content').innerHTML = '<div class="video-player-wrapper"><video src="https://example.com/video.mp4"></video></div>';
@@ -76,12 +165,20 @@ function fixture(options = {}) {
     const state = { paused: true, ended: false, currentTime: 0, duration: 10, readyState: 1, error: null, questionHandled: false };
     latestVideo = { video, state };
     for (const property of ['paused', 'ended', 'currentTime', 'duration', 'readyState', 'error']) {
-      Object.defineProperty(video, property, { get: () => state[property] });
+      Object.defineProperty(video, property, { get: () => state[property], ...(property === 'currentTime' ? {
+        set: value => {
+          assert.equal(value, 0, '补播只允许回到开头，不向前跳进度');
+          state.currentTime = value; state.ended = false; mediaEvents.push('rewind');
+        },
+      } : {}) });
     }
     let timer = null;
     const advance = () => {
       if (state.paused || options.videoMode === 'stall') return;
       state.currentTime++;
+      if (options.videoMode === 'confirm-during-replay' && state.currentTime === 3) {
+        card.querySelector('.finished-icon').textContent = '100%'; mediaEvents.push('site-completed');
+      }
       if (options.videoMode === 'mid-pause' && state.currentTime === 3) {
         state.paused = true;
         return;
@@ -121,6 +218,9 @@ function fixture(options = {}) {
     };
     video.pause = () => { state.paused = true; w.clearTimeout(timer); mediaEvents.push('pause'); };
     if (options.siteAutoplay) video.play();
+    if (options.restoreAtEnd) {
+      state.currentTime = state.duration; state.ended = true;
+    }
     if (options.videoAlreadyFinished) {
       state.ended = true; state.currentTime = state.duration;
       card.querySelector('.finished-icon').textContent = '已完成';
@@ -139,11 +239,26 @@ function fixture(options = {}) {
         card.className = 'basic-info-video-card-container';
         card.innerHTML = `<div class="icon-box ${resource.type}"></div><h5 class="video-title"></h5><div class="finished-icon"></div>`;
         card.querySelector('h5').textContent = resource.title;
+        if (resource.external && options.externalMode === 'anchor') {
+          const link = d.createElement('a'); link.href = 'https://example.org/article'; link.target = '_blank';
+          link.textContent = '外部文章链接'; card.appendChild(link);
+        }
         if (resource.type === 'video') card.querySelector('.finished-icon').textContent = '0%';
         card.addEventListener('click', () => {
           calls.push(`${current}:${resource.title}`);
           mediaEvents.push(`click:${resource.title}`);
           if (options.hardResource) { leave(current, resource.title); return; }
+          if (resource.external) {
+            const openExternal = () => {
+              if (options.externalMode !== 'anchor') w.open('https://example.org/article', 'shared-article-window');
+              if (!['unconfirmed', 'blocked', 'close-denied'].includes(options.externalMode)) realTimeout(() => {
+                card.querySelector('.finished-icon').textContent = '已完成'; mediaEvents.push('external-completed');
+              }, 30);
+            };
+            if (options.externalMode === 'delayed') realTimeout(openExternal, 30);
+            else openExternal();
+            return;
+          }
           content.querySelectorAll('.active').forEach(e => e.classList.remove('active'));
           card.classList.add('active');
           d.querySelector('.preview-content').innerHTML = '<div class="empty-previewType">请点击知识点资源学习～</div>';
@@ -160,6 +275,7 @@ function fixture(options = {}) {
           if (resource.type === 'video') mountVideo(card);
         }
         if (options.videoAlreadyFinished && resource.type === 'video') card.querySelector('.finished-icon').textContent = '已完成';
+        if (options.externalFinished && resource.external) card.querySelector('.finished-icon').textContent = '已完成';
         section.querySelector('.resources-list').appendChild(card);
       }
       content.appendChild(section);
@@ -199,7 +315,7 @@ function fixture(options = {}) {
   }
   const records = () => JSON.parse(w.sessionStorage.getItem(key) || '{}');
   const done = () => !ui('start').disabled;
-  return { dom, w, d, calls, mediaEvents, get media() { return latestVideo; }, ui, records, done, storage,
+  return { dom, w, d, calls, mediaEvents, externalTabs, originalOpen, get media() { return latestVideo; }, ui, records, done, storage,
     get navigation() { return navigation; }, get randomCalls() { return randomCalls; }, close: () => dom.window.close() };
 }
 
@@ -539,17 +655,89 @@ test('视频已结束但卡片未更新时刷新一次，完成状态刷新后�
   } finally { f.close(); }
 });
 
-test('刷新后视频仍未完成则停止，不再次刷新或重新播放', async () => {
+test('正常播完未获完成标记时最多补播两次，刷新不能重置次数', async () => {
   let f = fixture({ videoEnabled: true, videoMode: 'no-confirm', captureReload: true });
   try {
     f.ui('scope').value = 'current'; f.ui('seconds').value = '2'; f.ui('start').click();
     await until(() => f.navigation);
+    for (let retry = 1; retry <= 2; retry++) {
+      const storage = f.navigation.storage;
+      f.close(); f = fixture({ storage, captureReload: true, videoMode: 'no-confirm', restoreAtEnd: true });
+      await until(() => f.navigation);
+      const pending = JSON.parse(f.navigation.storage[`${key}:run`]).pending;
+      assert.equal(pending.completionRetries, retry);
+      assert.equal(pending.videoProgress.ended, true);
+      assert.equal(f.mediaEvents.filter(e => e === 'rewind').length, 1);
+      assert.equal(f.mediaEvents.filter(e => e === 'play').length, 1);
+      assert.equal(Object.values(f.records()).some(r => r.status === 'video-complete'), false);
+    }
     const storage = f.navigation.storage;
     f.close(); f = fixture({ storage, captureReload: true });
     await until(f.done);
-    assert.match(f.ui('status').textContent, /刷新核对，但网站仍未显示完成/);
+    assert.match(f.ui('status').textContent, /已自动补播 2 次并刷新核对/);
     assert.equal(f.mediaEvents.includes('play'), false);
     assert.equal(f.navigation, null);
+  } finally { f.close(); }
+});
+
+for (const mode of ['delayed-confirm', 'confirm-during-replay']) {
+  test(`补播从头播放，网站确认后接续下一资源：${mode}`, async () => {
+    let f = fixture({ videoEnabled: true, videoMode: 'no-confirm', captureReload: true, afterVideoDoc: true });
+    try {
+      f.ui('scope').value = 'current'; f.ui('start').click();
+      await until(() => f.navigation);
+      const storage = f.navigation.storage;
+      f.close(); f = fixture({ storage, videoMode: mode, restoreAtEnd: true, afterVideoDoc: true });
+      await until(f.done);
+      assert.match(f.ui('status').textContent, /本轮资源处理结束/);
+      assert.equal(f.mediaEvents.filter(e => e === 'rewind').length, 1);
+      assert.ok(f.mediaEvents.indexOf('site-completed') < f.mediaEvents.indexOf('click:视频后图文'));
+      assert.equal(Object.values(f.records()).find(r => r.title === '选学视频').status, 'video-complete');
+      if (mode === 'confirm-during-replay') {
+        assert.equal(f.media.state.ended, false);
+        assert.equal(f.media.state.paused, true);
+        assert.ok(f.media.state.currentTime < f.media.state.duration);
+      }
+    } finally { f.close(); }
+  });
+}
+
+test('补播遇到弹题后继续沿用进度和次数，不再次回到开头', async () => {
+  let f = fixture({ videoEnabled: true, videoMode: 'no-confirm', captureReload: true });
+  try {
+    f.ui('scope').value = 'current'; f.ui('start').click();
+    await until(() => f.navigation);
+    const storage = f.navigation.storage;
+    f.close(); f = fixture({ storage, videoMode: 'question', restoreAtEnd: true });
+    await until(f.done);
+    assert.match(f.ui('status').textContent, /弹题或网站弹窗/);
+    assert.equal(JSON.parse(f.storage()[`${key}:run`]).pending.completionRetries, 1);
+    assert.equal(Object.values(f.records()).some(r => r.status === 'video-complete'), false);
+    f.media.state.questionHandled = true; f.d.getElementById('quiz').remove();
+    f.ui('start').click(); await until(f.done);
+    assert.match(f.ui('status').textContent, /本轮资源处理结束/);
+    assert.equal(f.mediaEvents.filter(e => e === 'rewind').length, 1);
+    assert.equal(f.calls.filter(c => c === '0:选学视频').length, 1);
+  } finally { f.close(); }
+});
+
+test('补播打开卡片发生整页跳转时保留补播请求和次数', async () => {
+  let f = fixture({ videoEnabled: true, videoMode: 'no-confirm', captureReload: true });
+  try {
+    f.ui('scope').value = 'current'; f.ui('start').click();
+    await until(() => f.navigation);
+    let storage = f.navigation.storage;
+    f.close(); f = fixture({ storage, hardResource: true });
+    await until(() => f.navigation);
+    storage = f.navigation.storage;
+    const pending = JSON.parse(storage[`${key}:run`]).pending;
+    assert.equal(pending.completionRetries, 1);
+    assert.equal(pending.replayRequested, true);
+    f.close(); f = fixture({ storage, activeResource: '选学视频', restoreAtEnd: true });
+    await until(f.done);
+    assert.match(f.ui('status').textContent, /本轮资源处理结束/);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.mediaEvents.filter(e => e === 'rewind').length, 1);
   } finally { f.close(); }
 });
 
