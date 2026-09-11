@@ -1,0 +1,7 @@
+{
+  "name": "zhihuishu-resource-opener",
+  "version": "1.2.2",
+  "private": true,
+  "scripts": { "test": "node --test tests/opener.test.cjs", "check": "node --check zhihuishu-open-resources.user.js" },
+  "devDependencies": { "jsdom": "26.1.0" }
+}
