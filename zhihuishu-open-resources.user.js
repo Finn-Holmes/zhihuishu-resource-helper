@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树新形态课程 · 学习资源逐个打开
 // @namespace    local.zhihuishu.resource-opener
-// @version      1.2.2
+// @version      1.2.4
 // @description  逐个打开学习资源并正常播放视频，支持刷新接续、暂停、完成状态检查和日志导出。
 // @match        https://ai-smart-course-student-pro.zhihuishu.com/*
 // @run-at       document-idle
@@ -12,6 +12,7 @@
 (() => {
   'use strict';
   const PANEL_ID = 'zhs-resource-opener-v1';
+  const MAX_VIDEO_REPLAYS = 2;
   if (document.getElementById(PANEL_ID)) return;
   const S = {
     point: '.section-item-collapse .section-item-collapse-info',
@@ -39,6 +40,95 @@
   let runState = null;
   let documentLeaving = false;
   let activeVideo = null;
+  let activeExternal = null;
+
+  function externalURL(value) {
+    try {
+      const url = new URL(value, location.href);
+      return /^https?:$/.test(url.protocol) && url.host !== location.host ? url : null;
+    } catch { return null; }
+  }
+
+  function watchExternal(resource, key) {
+    const originalOpen = window.open;
+    const started = Date.now();
+    const watch = { opened: false, error: null, child: null, stopped: false };
+    const stopCapture = () => {
+      watch.stopped = true;
+      if (window.open === wrappedOpen) window.open = originalOpen;
+      document.removeEventListener('click', onLink);
+      document.removeEventListener('pointerdown', onUserInput, true);
+      document.removeEventListener('keydown', onUserInput, true);
+    };
+    const onUserInput = event => { if (event.isTrusted) stopCapture(); };
+    function wrappedOpen(url, target, features) {
+      const external = externalURL(url);
+      if (watch.stopped || !external || Date.now() - started > 10000 ||
+          runState?.pending?.key !== key || controller?.signal.aborted ||
+          location.pathname !== expectedPath || !resource.node.isConnected) {
+        return originalOpen.call(window, url, target, features);
+      }
+      // 使用新窗口，避免复用并关闭用户原有的具名标签页。保留网站提供的窗口特性。
+      const child = originalOpen.call(window, url, '_blank', features);
+      watch.opened = true;
+      watch.child = child;
+      runState.pending.external = { opened: true, closed: false, host: external.host };
+      saveRun();
+      stopCapture();
+      if (!child) {
+        watch.error = new Error('未取得外部资源标签页的控制权，可能被浏览器拦截或链接使用了 noopener。请检查新页并手动关闭后重试。');
+      } else log(`已打开外部资源：${resource.title}（${external.host}）`);
+      return child;
+    }
+    function onLink(event) {
+      if (event.isTrusted || event.defaultPrevented || watch.stopped) return;
+      const link = event.target.closest?.('a[href]');
+      if (!link || !resource.node.contains(link) || !externalURL(link.href)) return;
+      event.preventDefault();
+      wrappedOpen(link.href, '_blank', /\b(noopener|noreferrer)\b/.test(link.rel) ? link.rel.replace(/\s+/g, ',') : undefined);
+    }
+    watch.close = () => {
+      stopCapture();
+      if (watch.child) {
+        try {
+          if (!watch.child.closed && !watch.closeRequested) {
+            watch.child.close();
+            watch.closeRequested = true;
+          }
+          if (watch.child.closed && runState?.pending?.key === key && runState.pending.external) {
+            runState.pending.external.closed = true;
+            saveRun();
+          }
+          if (watch.child.closed) watch.child = null;
+        } catch (error) { watch.error = error; }
+      }
+    };
+    window.open = wrappedOpen;
+    document.addEventListener('click', onLink);
+    document.addEventListener('pointerdown', onUserInput, true);
+    document.addEventListener('keydown', onUserInput, true);
+    return watch;
+  }
+
+  function finishExternalWatch() {
+    activeExternal?.close();
+    activeExternal = null;
+  }
+
+  async function confirmExternal(resource) {
+    const pending = runState.pending;
+    if (!pending.external.closed) throw new Error('此前打开的外部资源页尚未确认关闭，请检查标签页；确认后可清空访问记录重新运行。');
+    log(`外部资源页已关闭，核对网站完成标记：${resource.title}`);
+    const until = Date.now() + 15000;
+    while (!resources().find(r => r.key === resource.key)?.finished && Date.now() < until) await delay(250);
+    if (resources().find(r => r.key === resource.key)?.finished) return;
+    if (pending.external.completionRefresh) throw new Error(`外部资源已打开并关闭，刷新后网站仍未显示完成：${resource.title}。请检查资源状态。`);
+    pending.external.completionRefresh = true;
+    saveRun();
+    log(`外部资源卡片未更新，刷新一次核对：${resource.title}`);
+    location.reload();
+    await waitFor(() => false, '刷新页面核对外部资源；若刷新被阻止，请手动刷新', 15000);
+  }
 
   function route() {
     const match = location.pathname.match(/^\/learnPage\/([^/]+)\/([^/]+)\/([^/]+)\/?$/);
@@ -76,6 +166,7 @@
     if (runState) { runState.status = 'paused'; saveRun(); }
     controller?.abort();
     stopVideo();
+    finishExternalWatch();
   }
 
   function stopVideo() {
@@ -231,10 +322,15 @@
       }, '视频时长和播放信息加载', 40000);
       assertSelected(resource);
       const source = video.currentSrc || video.getAttribute('src');
-      // 播放进度交给网站恢复；不修改 currentTime，不伪造 ended 或学习上报。
+      // 首次播放沿用网站进度；核对失败的补播才从头开始，不向前跳进度。
       video.muted = !!settings.muted;
       video.playbackRate = 1;
-      if (video.paused && !video.ended) {
+      if (runState.pending.replayRequested) {
+        endedObserved = false;
+        video.currentTime = 0;
+        log(`从头补播视频（${runState.pending.completionRetries}/${MAX_VIDEO_REPLAYS}）：${resource.title}`);
+      }
+      if (video.paused && (!video.ended || runState.pending.replayRequested)) {
         let resolved = false;
         let rejection = null;
         try {
@@ -242,9 +338,12 @@
         } catch (error) { rejection = error; }
         await waitFor(() => {
           if (rejection) throw new Error(`浏览器未允许播放视频（${rejection.name || '播放失败'}）。请手动点击播放器播放，再点脚本“开始 / 继续”。`);
-          return resolved || !video.paused;
+          return !video.ended && (resolved || !video.paused);
         }, '视频开始播放；如被拦截请手动点击播放', 15000);
       }
+      checkpoint();
+      runState.pending.replayRequested = false;
+      saveRun();
       log(`正在播放视频：${resource.title}（${videoTime(video.currentTime)} / ${videoTime(video.duration)}）`);
       let previousTime = video.currentTime;
       let progressedAt = Date.now();
@@ -258,6 +357,11 @@
           throw new Error('播放器或视频源发生变化，已停止；请确认当前资源后继续。');
         }
         if (video.error) throw new Error(`视频播放失败（错误码 ${video.error.code}），请检查网络后继续。`);
+        if (runState.pending.completionRetries > 0 && resources().find(r => r.key === resource.key)?.finished) {
+          endReason = 'replay';
+          stopVideo();
+          break;
+        }
         const now = Date.now();
         if (now - savedAt >= 5000 || video.ended || endedObserved) {
           runState.pending.videoProgress = { currentTime: video.currentTime, duration: video.duration,
@@ -297,7 +401,7 @@
         }
         await delay(500);
       }
-      log(`${endReason === 'ended' ? '视频已播完' : '视频在末尾暂停，尚未确认完成'}，等待网站更新完成标记：${resource.title}`);
+      log(`${endReason === 'ended' ? '视频已播完' : endReason === 'replay' ? '补播期间网站已确认完成' : '视频在末尾暂停，尚未确认完成'}，核对网站完成标记：${resource.title}`);
       const confirmUntil = Date.now() + 15000;
       while (!resources().find(r => r.key === resource.key)?.finished && Date.now() < confirmUntil) {
         checkpoint();
@@ -440,6 +544,7 @@
       const list = await openPoint(point);
       const pointId = route().point;
       for (let i = 0; i < list.length; i++) {
+        finishExternalWatch();
         checkpoint();
         const resource = list[i];
         const key = JSON.stringify([pointId, resource.key]);
@@ -461,7 +566,22 @@
           continue;
         }
         if (resource.video && runState.pending?.key === key && runState.pending.completionRefresh) {
-          throw new Error(`视频结束状态已刷新核对，但网站仍未显示完成：${resource.title}。已停止，请检查平台进度或未完成的题目。`);
+          const pendingVideo = runState.pending;
+          if (!pendingVideo.videoProgress?.ended) {
+            throw new Error(`视频末尾暂停后已刷新核对，但网站仍未显示完成：${resource.title}。未观察到正常播放结束，已停止，请检查播放器或题目。`);
+          }
+          const retries = Number.isInteger(pendingVideo.completionRetries) && pendingVideo.completionRetries >= 0
+            ? pendingVideo.completionRetries : 0;
+          if (retries >= MAX_VIDEO_REPLAYS) {
+            throw new Error(`视频已自动补播 ${MAX_VIDEO_REPLAYS} 次并刷新核对，但网站仍未显示完成：${resource.title}。已停止，请检查平台进度或未完成的题目。`);
+          }
+          pendingVideo.completionRetries = retries + 1;
+          pendingVideo.completionRefresh = false;
+          pendingVideo.replayRequested = true;
+          pendingVideo.attempts = 0;
+          delete pendingVideo.videoProgress;
+          saveRun();
+          log(`刷新后视频仍未完成，自动补播 ${retries + 1}/${MAX_VIDEO_REPLAYS}：${resource.title}`);
         }
         if (!resource.video && onlyNew && records[key]?.status === 'visited') continue;
         ui.status.textContent = `${p + 1}/${queue.length} ${point.name} · 资源 ${i + 1}/${list.length}：${resource.title}`;
@@ -469,18 +589,21 @@
         if (!fresh || !visible(fresh.node)) throw new Error(`资源卡片不可用：${resource.title}`);
         const pending = runState.pending?.kind === 'resource' && runState.pending.key === key
           ? runState.pending : null;
+        const resumeExternal = !!pending?.external?.opened;
         // 每项图文单独抽取 1～5 秒；在点击前保存，整页跳转后沿用同一次抽取。
         const dwellSeconds = resource.video ? seconds : pending?.dwellSeconds ??
           (settings.randomDwell ? 1 + Math.floor(Math.random() * 5) : seconds);
         // 卡片点击引起整页加载后，先验证已选中的资源，避免再次点击造成刷新循环。
         const keepCurrentVideo = resource.video && fresh.node.classList.contains('active');
-        if ((!pending && !keepCurrentVideo) || !fresh.node.classList.contains('active')) {
+        if (!resumeExternal && ((!pending && !keepCurrentVideo) || !fresh.node.classList.contains('active'))) {
           const attempts = pending?.attempts || 0;
           if (attempts >= 2) throw new Error(`资源打开后未保持选中，已停止重复刷新：${resource.title}`);
-          runState.pending = { kind: 'resource', key, attempts: attempts + 1, video: resource.video, dwellSeconds };
+          runState.pending = { ...pending, kind: 'resource', key, attempts: attempts + 1, video: resource.video, dwellSeconds };
           saveRun();
           log(`正在打开资源：${resource.title}`);
-          fresh.node.click();
+          if (!resource.media) activeExternal = watchExternal(fresh, key);
+          const externalLink = all('a[href]', fresh.node).find(link => visible(link) && externalURL(link.href));
+          (externalLink || fresh.node).click();
         } else {
           if (!pending) {
             runState.pending = { kind: 'resource', key, attempts: 0, video: resource.video, dwellSeconds };
@@ -490,17 +613,34 @@
         }
         runState.pending.dwellSeconds = dwellSeconds;
         saveRun();
-        await waitFor(() => resources().find(r => r.key === resource.key)?.node.classList.contains('active'), '选中资源');
+        await waitFor(() => {
+          if (activeExternal?.error) throw activeExternal.error;
+          return resumeExternal || activeExternal?.opened || resources().find(r => r.key === resource.key)?.node.classList.contains('active');
+        }, '选中资源或打开外部资源标签页');
         if (!resource.video) log(`图文停留 ${dwellSeconds} 秒（${settings.randomDwell ? '随机' : '固定'}）：${resource.title}`);
-        await delay(dwellSeconds * 1000);
+        if (!resumeExternal) await delay(dwellSeconds * 1000);
         const videoResult = resource.video ? await playVideo(resource, settings) : null;
-        if (!resource.video) await waitFor(previewReady, '资源预览显示');
+        if (!resource.video && !resumeExternal) await waitFor(() => {
+          if (activeExternal?.error) throw activeExternal.error;
+          return activeExternal?.opened || previewReady();
+        }, '资源预览显示或外部资源标签页打开');
+        if (activeExternal?.opened) {
+          await waitFor(() => {
+            activeExternal.close();
+            if (activeExternal.error) throw activeExternal.error;
+            return runState.pending.external.closed;
+          }, '关闭本次打开的外部资源标签页；如被阻止请手动关闭', 5000);
+        }
+        const external = runState.pending.external;
+        if (external?.opened) await confirmExternal(resource);
+        finishExternalWatch();
         checkpoint();
         const after = resources().find(r => r.key === resource.key);
-        if (!after?.node.classList.contains('active')) throw new Error('资源被切换，已停止记录。');
+        if (!after || (!external?.opened && !after.node.classList.contains('active'))) throw new Error('资源被切换，已停止记录。');
         records[key] = { point: point.name, title: resource.title, group: resource.group,
           status: resource.video ? 'video-complete' : 'visited', siteFinished: after.finished,
           ...(!resource.video ? { dwellSeconds } : {}),
+          ...(external?.opened ? { external: true, externalHost: external.host, completion: 'external-and-site-confirmed' } : {}),
           ...(videoResult || {}), time: new Date().toISOString() };
         saveRecords(); summary();
         runState.doneResources.push(key);
@@ -547,6 +687,7 @@
       log(message);
     } finally {
       stopVideo();
+      finishExternalWatch();
       activeVideo = null;
       busy = false;
       navigating = false;
@@ -574,7 +715,7 @@
 
   function exportRecords() {
     loadRecords();
-    const blob = new Blob([JSON.stringify({ version: '1.2.2', course: route().course,
+    const blob = new Blob([JSON.stringify({ version: '1.2.4', course: route().course,
       exportedAt: new Date().toISOString(), resources: Object.values(records), logs: messages,
       run: JSON.parse(sessionStorage.getItem(`${recordKey}:run`) || 'null') }, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -598,7 +739,7 @@
       #start{background:#2166ce;color:#fff;border-color:#2166ce} .buttons{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
       #status{overflow-wrap:anywhere;margin:10px 0;font-weight:600} #stats,.hint{font-size:12px;color:#53657b} pre{white-space:pre-wrap;overflow-wrap:anywhere;font-family:inherit;font-size:12px;line-height:1.5;min-height:64px;max-height:140px;overflow:auto;background:#f4f7fb;padding:8px;border-radius:6px}
     </style>
-    <details open><summary>学习资源逐个打开 · v1.2.2</summary><div class="body">
+    <details open><summary>学习资源逐个打开 · v1.2.4</summary><div class="body">
       <div class="hint">逐个打开资源；视频按原速播放并检查完成标记。</div>
       <label>范围 <select id="scope"><option value="all">全部知识点</option><option value="current">仅当前知识点（试跑）</option></select></label>
       <label><input id="randomDwell" type="checkbox" checked> 图文每次随机停留 1～5 秒</label>
@@ -641,6 +782,7 @@
     if (event.altKey && event.shiftKey && event.code === 'KeyS') safely(pause)();
   });
   window.addEventListener('pagehide', () => {
+    finishExternalWatch();
     // pagehide 不等于用户暂停：状态已在点击前保存，旧文档不应再将其覆盖为错误。
     documentLeaving = true;
     controller?.abort();
