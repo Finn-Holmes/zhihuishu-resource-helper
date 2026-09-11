@@ -10,7 +10,7 @@ const ids = ['9000000000000000002', '9000000000000000003'];
 const url = id => `https://ai-smart-course-student-pro.zhihuishu.com/learnPage/${course}/${id}/256522`;
 const key = `zhs-resource-opener:v1:${course}:256522`;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-for (const externalMode of ['normal', 'delayed', 'anchor']) {
+for (const externalMode of ['normal', 'delayed', 'anchor', 'noopener', 'native-blocked', 'async-close', 'blank', 'empty-url', 'no-url']) {
   test(`外部文章页打开后关闭并核对完成，不等待内嵌预览：${externalMode}`, async () => {
     const f = fixture({ externalResource: true, externalMode });
     try {
@@ -24,6 +24,8 @@ for (const externalMode of ['normal', 'delayed', 'anchor']) {
       assert.equal(manualTab.closed, false);
       assert.equal(f.externalTabs[1].closed, true);
       assert.equal(f.externalTabs[1].target, '_blank');
+      assert.equal(f.externalTabs[1].managed, true);
+      if (['blank', 'empty-url', 'no-url'].includes(externalMode)) assert.equal(f.externalTabs[1].url, 'about:blank');
       assert.equal(f.w.open, f.originalOpen);
       assert.ok(f.mediaEvents.indexOf('external-closed') < f.mediaEvents.indexOf('click:共享课件.ppt'));
     } finally { f.close(); }
@@ -92,6 +94,62 @@ async function until(fn, timeout = 3500) {
   throw new Error('Test timed out');
 }
 
+test('空白页本身不是完成凭据，卡片未完成时刷新核对后停止', async () => {
+  let f = fixture({ externalResource: true, externalMode: 'blank-unconfirmed', captureReload: true });
+  try {
+    f.ui('scope').value = 'current'; f.ui('start').click(); await until(() => f.navigation);
+    assert.equal(f.externalTabs[0].url, 'about:blank');
+    assert.equal(f.externalTabs[0].closed, true);
+    const storage = f.navigation.storage;
+    f.close(); f = fixture({ storage, externalResource: true, captureReload: true });
+    await until(f.done);
+    assert.match(f.ui('status').textContent, /刷新后网站仍未显示完成/);
+    assert.equal(Object.keys(f.records()).length, 0);
+    assert.equal(f.externalTabs.length, 0);
+    assert.equal(f.navigation, null);
+  } finally { f.close(); }
+});
+
+test('旧版打开空白页后报错，卡片已完成时接续不再打开或等待预览', async () => {
+  let f = fixture({ externalResource: true });
+  try {
+    f.ui('scope').value = 'current'; f.ui('seconds').value = '60'; f.ui('start').click();
+    await until(() => f.externalTabs.length > 0);
+    f.ui('pause').click(); await until(f.done);
+    const storage = f.storage();
+    const saved = JSON.parse(storage[`${key}:run`]);
+    saved.status = 'error'; delete saved.pending.external;
+    storage[`${key}:run`] = JSON.stringify(saved);
+    f.close(); f = fixture({ storage, externalResource: true, externalFinished: true });
+    f.ui('start').click(); await until(f.done);
+    assert.match(f.ui('status').textContent, /本轮非视频资源访问结束/);
+    assert.equal(f.externalTabs.length, 0);
+    assert.equal(f.calls.includes('0:外部文章'), false);
+    assert.equal(Object.values(f.records()).find(r => r.title === '外部文章').completion, 'site-confirmed-on-resume');
+  } finally { f.close(); }
+});
+
+test('旧版外链没有窗口句柄的错误可以升级接续，保留其他记录', async () => {
+  let f = fixture({ externalResource: true });
+  try {
+    f.ui('scope').value = 'current'; f.ui('seconds').value = '60'; f.ui('start').click();
+    await until(() => f.externalTabs.length > 0);
+    f.ui('pause').click(); await until(f.done);
+    const storage = f.storage();
+    const saved = JSON.parse(storage[`${key}:run`]);
+    saved.status = 'error'; saved.pending.external.closed = false; delete saved.pending.external.managed;
+    storage[`${key}:run`] = JSON.stringify(saved);
+    storage[key] = JSON.stringify({ previous: { title: '其他已访问资源', status: 'visited' } });
+    f.close(); f = fixture({ storage, externalResource: true, externalMode: 'noopener' });
+    f.ui('start').click(); await until(f.done);
+    assert.match(f.ui('status').textContent, /本轮非视频资源访问结束/);
+    assert.equal(f.records().previous.status, 'visited');
+    assert.equal(f.externalTabs.length, 1);
+    assert.equal(f.externalTabs[0].closed, true);
+    assert.match(f.ui('log').textContent, /旧版遗留的文章标签页请手动关闭/);
+  } finally { f.close(); }
+});
+
 // 最小站点模拟：使用现场观察到的 class、折叠目录、分组数量和卡片状态。
 // 验证整段用户脚本通过其面板驱动 DOM，不向生产脚本添加测试后门。
 function fixture(options = {}) {
@@ -114,17 +172,28 @@ function fixture(options = {}) {
   const calls = [];
   const mediaEvents = [];
   const externalTabs = [];
-  const originalOpen = (url, target, features) => {
-    if (options.externalMode === 'blocked') return null;
+  const makeTab = (url, target, features, managed = false) => {
     const child = { url, target, features, closed: false, close() {
       if (options.externalMode === 'close-denied') return;
-      this.closed = true;
-      mediaEvents.push('external-closed');
+      const closed = () => { this.closed = true; mediaEvents.push('external-closed'); this.onclose?.(); };
+      if (options.externalMode === 'async-close') setTimeout(closed, 10);
+      else closed();
     } };
+    child.managed = managed;
     externalTabs.push(child);
     return child;
   };
+  const originalOpen = (url, target, features) => {
+    if (!String(url).endsWith('/manual') && (options.externalMode === 'native-blocked' || /noopener/.test(features || ''))) return null;
+    return makeTab(url, target, features);
+  };
   w.open = originalOpen;
+  w.unsafeWindow = w;
+  w.GM_openInTab = (url, config) => {
+    if (options.externalMode === 'blocked') return null;
+    assert.equal(config.active, false);
+    return makeTab(url, '_blank', undefined, true);
+  };
   let latestVideo = null;
   const realTimeout = w.setTimeout.bind(w);
   w.setTimeout = (fn, ms, ...args) => realTimeout(fn, Math.max(1, ms / 100), ...args);
@@ -250,8 +319,11 @@ function fixture(options = {}) {
           if (options.hardResource) { leave(current, resource.title); return; }
           if (resource.external) {
             const openExternal = () => {
-              if (options.externalMode !== 'anchor') w.open('https://example.org/article', 'shared-article-window');
-              if (!['unconfirmed', 'blocked', 'close-denied'].includes(options.externalMode)) realTimeout(() => {
+              if (options.externalMode !== 'anchor') {
+                if (options.externalMode === 'no-url') w.open();
+                else w.open(['blank', 'blank-unconfirmed'].includes(options.externalMode) ? 'about:blank' : options.externalMode === 'empty-url' ? '' : 'https://example.org/article', 'shared-article-window', options.externalMode === 'noopener' ? 'noopener,noreferrer' : undefined);
+              }
+              if (!['unconfirmed', 'blank-unconfirmed', 'blocked', 'close-denied'].includes(options.externalMode)) realTimeout(() => {
                 card.querySelector('.finished-icon').textContent = '已完成'; mediaEvents.push('external-completed');
               }, 30);
             };
