@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧树新形态课程 · 学习资源逐个打开
 // @namespace    local.zhihuishu.resource-opener
-// @version      1.2.6
+// @version      1.2.7
 // @description  逐个打开学习资源并正常播放视频，支持刷新接续、暂停、完成状态检查和日志导出。
 // @match        https://ai-smart-course-student-pro.zhihuishu.com/*
 // @run-at       document-idle
@@ -265,7 +265,7 @@
         occurrences.set(base, index + 1);
         const status = text(node.querySelector('.finished-icon'));
         return { key: `${base}:${index}`, title, group, media, video, audio, node,
-          finished: status.includes('已完成') || (video && /^100(?:\.0+)?\s*%$/.test(status)) };
+          finished: status === '已完成' || (video && /^100(?:\.0+)?\s*%$/.test(status)) };
       });
     }).filter(item => item.title);
   }
@@ -507,7 +507,7 @@
   function summary() {
     const entries = Object.values(records);
     const visited = entries.filter(r => ['visited', 'video-complete'].includes(r.status)).length;
-    const confirmed = entries.filter(r => ['visited', 'video-complete'].includes(r.status) && r.siteFinished).length;
+    const confirmed = entries.filter(r => ['visited', 'video-complete', 'site-complete'].includes(r.status) && r.siteFinished).length;
     const videos = entries.filter(r => r.status === 'video-complete').length;
     const skipped = entries.filter(r => r.status === 'skipped-media').length;
     ui.stats.textContent = `本标签页记录：已访问 ${visited} · 网站已完成 ${confirmed} · 视频完成 ${videos} · 跳过音视频 ${skipped}`;
@@ -567,9 +567,11 @@
       for (let i = 0; i < list.length; i++) {
         finishExternalWatch();
         checkpoint();
-        const resource = list[i];
+        // 前一项处理期间网站可能更新卡片，跳过判断必须使用当前 DOM。
+        const resource = resources().find(r => r.key === list[i].key);
+        if (!resource || !visible(resource.node)) throw new Error(`资源卡片不可用：${list[i].title}`);
         const key = JSON.stringify([pointId, resource.key]);
-        // 本轮游标独立于历史记录，即使取消“跳过已访问”，刷新也不会重放已处理的资源。
+        // 本轮游标仅用于任务接续，不代表网站完成；新一轮会重新核对网站状态。
         if (runState.doneResources.includes(key)) continue;
         // 旧版未捕获空白页而报错时，升级接续只核对已完成卡片，不再重复打开。
         if (!resource.media && resource.finished && runState.pending?.key === key && !runState.pending.external?.opened) {
@@ -614,7 +616,15 @@
           saveRun();
           log(`刷新后视频仍未完成，自动补播 ${retries + 1}/${MAX_VIDEO_REPLAYS}：${resource.title}`);
         }
-        if (!resource.video && onlyNew && records[key]?.status === 'visited') continue;
+        if (!resource.media && onlyNew && resource.finished &&
+            !(runState.pending?.key === key && runState.pending.external?.opened)) {
+          records[key] = { point: point.name, title: resource.title, group: resource.group,
+            status: 'site-complete', siteFinished: true, completion: 'site-already-complete', time: new Date().toISOString() };
+          runState.doneResources.push(key); runState.pending = null;
+          saveRecords(); saveRun(); summary();
+          log(`网站已标记资源完成，跳过打开与停留：${resource.title}`);
+          continue;
+        }
         ui.status.textContent = `${p + 1}/${queue.length} ${point.name} · 资源 ${i + 1}/${list.length}：${resource.title}`;
         const fresh = resources().find(r => r.key === resource.key);
         if (!fresh || !visible(fresh.node)) throw new Error(`资源卡片不可用：${resource.title}`);
@@ -751,7 +761,7 @@
 
   function exportRecords() {
     loadRecords();
-    const blob = new Blob([JSON.stringify({ version: '1.2.6', course: route().course,
+    const blob = new Blob([JSON.stringify({ version: '1.2.7', course: route().course,
       exportedAt: new Date().toISOString(), resources: Object.values(records), logs: messages,
       run: JSON.parse(sessionStorage.getItem(`${recordKey}:run`) || 'null') }, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -775,12 +785,12 @@
       #start{background:#2166ce;color:#fff;border-color:#2166ce} .buttons{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
       #status{overflow-wrap:anywhere;margin:10px 0;font-weight:600} #stats,.hint{font-size:12px;color:#53657b} pre{white-space:pre-wrap;overflow-wrap:anywhere;font-family:inherit;font-size:12px;line-height:1.5;min-height:64px;max-height:140px;overflow:auto;background:#f4f7fb;padding:8px;border-radius:6px}
     </style>
-    <details open><summary>学习资源逐个打开 · v1.2.6</summary><div class="body">
+    <details open><summary>学习资源逐个打开 · v1.2.7</summary><div class="body">
       <div class="hint">逐个打开资源；视频按原速播放并检查完成标记。</div>
       <label>范围 <select id="scope"><option value="all">全部知识点</option><option value="current">仅当前知识点（试跑）</option></select></label>
       <label><input id="randomDwell" type="checkbox" checked> 图文每次随机停留 1～5 秒</label>
       <label id="fixedWait" hidden>图文固定停留 <input id="seconds" type="number" min="1" max="60" value="4"> 秒</label>
-      <label><input id="onlyNew" type="checkbox" checked> 跳过本标签页已访问记录</label>
+      <label><input id="onlyNew" type="checkbox" checked> 跳过网站已完成资源</label>
       <label><input id="videos" type="checkbox" checked> 播放未完成的视频（含选学）</label>
       <label><input id="muted" type="checkbox" checked> 静音播放</label>
       <div class="buttons"><button id="scan">扫描</button><button id="start">开始 / 继续</button><button id="pause" disabled>暂停</button></div>
