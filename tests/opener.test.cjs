@@ -226,6 +226,7 @@ function fixture(options = {}) {
     [{ title: '教材片段', type: 'book', finished: false }, { title: '共享课件.ppt', type: 'other', finished: true }, { title: '选学视频', type: 'video', optional: true }],
     [{ title: '共享课件.ppt', type: 'other', finished: true }, { title: '选学图文', type: 'other', optional: true, finished: true }],
   ];
+  const siteCompleted = new Set(options.siteCompleted || []);
   if (options.externalResource) data[0][0] = { title: '外部文章', type: 'other', external: true };
   if (options.afterVideoDoc) data[0].push({ title: '视频后图文', type: 'other', optional: true, finished: true });
   function mountVideo(card) {
@@ -337,7 +338,10 @@ function fixture(options = {}) {
           if (!options.brokenPreview) realTimeout(() => {
             if (resource.type === 'video') mountVideo(card);
             else d.querySelector('.preview-content').innerHTML = '<div class="ppt-preview-box">资源正文</div>';
-            if (resource.finished) card.querySelector('.finished-icon').textContent = '已完成';
+            if (resource.finished) {
+              card.querySelector('.finished-icon').textContent = '已完成';
+              siteCompleted.add(`${index}:${resource.title}`);
+            }
           }, 8);
         });
         if (options.activeResource === resource.title) {
@@ -348,6 +352,7 @@ function fixture(options = {}) {
         }
         if (options.videoAlreadyFinished && resource.type === 'video') card.querySelector('.finished-icon').textContent = '已完成';
         if (options.externalFinished && resource.external) card.querySelector('.finished-icon').textContent = '已完成';
+        if (siteCompleted.has(`${index}:${resource.title}`)) card.querySelector('.finished-icon').textContent = '已完成';
         section.querySelector('.resources-list').appendChild(card);
       }
       content.appendChild(section);
@@ -406,7 +411,8 @@ test('遍历折叠目录、异步资源列表、同名课件；区分网站完�
     assert.equal(f.d.querySelectorAll('.el-collapse-item__header')[1].getAttribute('aria-expanded'), 'true');
     f.ui('start').click();
     await until(f.done);
-    assert.equal(f.calls.length, 4, '继续不会重复点击已访问资源');
+    assert.equal(f.calls.length, 5, '新一轮只重试网站仍未完成的教材片段');
+    assert.equal(f.calls[4], '0:教材片段');
   } finally { f.close(); }
 });
 
@@ -430,7 +436,7 @@ test('暂停立即阻止后续点击；未完成的访问在继续时重试', as
   } finally { f.close(); }
 });
 
-test('重建页面不自动开始，保留记录后可以续跑；可取消跳过以重访', async () => {
+test('重建页面不自动开始；旧访问记录不能跳过网站未完成资源', async () => {
   let f = fixture();
   try {
     f.ui('scope').value = 'current';
@@ -440,10 +446,75 @@ test('重建页面不自动开始，保留记录后可以续跑；可取消跳�
     await sleep(30);
     assert.equal(f.calls.length, 0);
     f.ui('start').click(); await until(f.done);
-    assert.deepEqual(f.calls, ['1:共享课件.ppt', '1:选学图文']);
+    assert.deepEqual(f.calls, ['0:教材片段', '0:共享课件.ppt', '1:共享课件.ppt', '1:选学图文']);
     f.ui('scope').value = 'current'; f.ui('onlyNew').checked = false;
     f.ui('start').click(); await until(f.done);
-    assert.equal(f.calls.length, 4);
+    assert.equal(f.calls.length, 6);
+  } finally { f.close(); }
+});
+
+for (const externalResource of [false, true]) {
+  test(`没有本地记录时按网站标记跳过，不打开也不抽取等待时间：外链=${externalResource}`, async () => {
+    // 两个全新标签页均没有 sessionStorage，网站完成状态仍能独立生效。
+    for (let session = 0; session < 2; session++) {
+      const f = fixture({ externalResource, randomDwell: true, randomValues: [0.5],
+        siteCompleted: [`0:${externalResource ? '外部文章' : '教材片段'}`, '0:共享课件.ppt'] });
+      try {
+        f.ui('scope').value = 'current'; f.ui('start').click(); await until(f.done);
+        assert.match(f.ui('status').textContent, /本轮非视频资源访问结束/);
+        assert.deepEqual(f.calls, []);
+        assert.equal(f.externalTabs.length, 0);
+        assert.equal(f.randomCalls, 0);
+        const completed = Object.values(f.records()).filter(r => r.status === 'site-complete');
+        assert.equal(completed.length, 2);
+        assert.ok(completed.every(r => r.siteFinished && r.dwellSeconds === undefined));
+        assert.match(f.ui('stats').textContent, /已访问 0 · 网站已完成 2/);
+      } finally { f.close(); }
+    }
+  });
+}
+
+test('取消跳过后可重访已完成图文，已完成视频仍不重播', async () => {
+  const f = fixture({ siteCompleted: ['0:教材片段', '0:共享课件.ppt'],
+    videoEnabled: true, videoAlreadyFinished: true, randomDwell: true, randomValues: [0.5] });
+  try {
+    f.ui('scope').value = 'current'; f.ui('onlyNew').checked = false;
+    f.ui('start').click(); await until(f.done);
+    assert.deepEqual(f.calls, ['0:教材片段', '0:共享课件.ppt']);
+    assert.equal(f.randomCalls, 2);
+    assert.equal(f.mediaEvents.includes('play'), false);
+  } finally { f.close(); }
+});
+
+test('逐项读取最新卡片状态，前一项等待期间更新完成的后一项直接跳过', async () => {
+  const f = fixture({ randomDwell: true, randomValues: [0.99] });
+  try {
+    f.ui('scope').value = 'current'; f.ui('start').click();
+    await until(() => f.calls.length === 1);
+    const oldCard = [...f.d.querySelectorAll('.basic-info-video-card-container')]
+      .find(c => c.querySelector('h5').textContent === '共享课件.ppt');
+    const newCard = oldCard.cloneNode(true);
+    newCard.querySelector('.finished-icon').textContent = '已完成';
+    oldCard.replaceWith(newCard);
+    await until(f.done);
+    assert.match(f.ui('status').textContent, /本轮非视频资源访问结束/);
+    assert.deepEqual(f.calls, ['0:教材片段']);
+    assert.equal(f.randomCalls, 1);
+    assert.equal(Object.values(f.records()).find(r => r.title === '共享课件.ppt').status, 'site-complete');
+  } finally { f.close(); }
+});
+
+test('历史记录即便曾确认完成，网站当前未完成时仍访问并等待', async () => {
+  const saved = JSON.stringify({ [JSON.stringify([ids[0], '["必学资源","教材片段"]:0'])]:
+    { status: 'visited', siteFinished: true } });
+  const f = fixture({ saved, randomDwell: true, randomValues: [0.99], siteCompleted: ['0:共享课件.ppt'] });
+  try {
+    f.ui('scope').value = 'current'; f.ui('start').click(); await until(f.done);
+    assert.deepEqual(f.calls, ['0:教材片段']);
+    assert.equal(f.randomCalls, 1);
+    const visited = Object.values(f.records()).find(r => r.title === '教材片段');
+    assert.equal(visited.siteFinished, false);
+    assert.equal(visited.dwellSeconds, 5);
   } finally { f.close(); }
 });
 
@@ -827,7 +898,8 @@ test('旧版跳过的视频升级后会处理；旧版运行队列不自动越�
     assert.equal(f.ui('videos').checked, true);
     assert.match(f.ui('status').textContent, /已升级视频版/);
     f.ui('start').click(); await until(f.done);
-    assert.deepEqual(f.calls, ['0:选学视频']);
+    assert.deepEqual(f.calls, ['0:教材片段', '0:共享课件.ppt', '0:选学视频'],
+      '旧记录不覆盖当前未完成标记，图文与遗漏视频都需处理');
     assert.equal(Object.values(f.records()).find(r => r.title === '选学视频').status, 'video-complete');
   } finally { f.close(); }
 });
